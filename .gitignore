@@ -1,0 +1,5 @@
+.idea
+.venv
+data
+models
+rag_builder/results
