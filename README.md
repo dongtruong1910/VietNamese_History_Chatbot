@@ -48,6 +48,11 @@ Dự án sử dụng các bộ dữ liệu chất lượng cao về **lịch s�
 - Học văn phong tự nhiên.  
 - Trang bị kiến thức nền tảng về lịch sử Việt Nam.
 
+### 🔹 Dữ liệu DPO 
+**Dataset:** `https://drive.google.com/file/d/1L-DqQjSMMZ2rRTstLyLx-6_oTjvjMB8V/view?usp=drive_link`  
+**Mục đích:**  
+- Huấn luyện mô hình để cải thiện chất lượng câu trả lời.
+
 ### 🔹 Dữ liệu RAG (Knowledge Base)
 **Dataset:** `minhxthanh/Vietnam-History-200K-Vi`  
 **Mục đích:**  
