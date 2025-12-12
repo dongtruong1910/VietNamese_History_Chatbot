@@ -7,3 +7,4 @@ faiss-cpu
 rank_bm25
 numpy
 accelerate
+bitsandbytes>=0.44.0

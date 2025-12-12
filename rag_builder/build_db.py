@@ -10,7 +10,7 @@ from sentence_transformers import SentenceTransformer
 # CẤU HÌNH
 # ---------------------------------------------------------
 current_dir = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(current_dir, '..', 'data', 'rawhistory_200k.jsonl')
+DATA_PATH = os.path.join(current_dir, '..', 'data', 'rawhistory_1tr.jsonl')
 OUTPUT_INDEX_PATH = os.path.join(current_dir, 'results', 'history_vector.index')
 OUTPUT_META_PATH = os.path.join(current_dir, 'results', 'history_metadata.pkl')
 

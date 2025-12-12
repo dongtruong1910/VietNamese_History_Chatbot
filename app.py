@@ -4,34 +4,42 @@ import gradio as gr
 import faiss
 import pickle
 import numpy as np
+import gc
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
-from peft import PeftModel
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from threading import Thread
 from rank_bm25 import BM25Okapi
+import wikipedia
 
 # ==============================================================================
 # 1. CẤU HÌNH
 # ==============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ADAPTER_DIR = os.path.join(BASE_DIR, "models", "DPO_Final_Model")
-BASE_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 
+
+MODEL_ID = "unsloth/Qwen2.5-3B-Instruct-bnb-4bit"
+
+# Đường dẫn Database
 RAG_INDEX_PATH = os.path.join(BASE_DIR, "rag_builder", "results", "history_vector.index")
 RAG_META_PATH = os.path.join(BASE_DIR, "rag_builder", "results", "history_metadata.pkl")
 
+# Cấu hình Logic
+RERANK_TOP_K = 5  # Chỉ lấy 5 kết quả tốt nhất để rerank
+RAG_THRESHOLD = 0.9
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"🖥️ Device: {device.upper()}")
+print(f"🖥️ Main DeGvice: {device.upper()}")
 
 # ==============================================================================
 # 2. LOAD COMPONENT
 # ==============================================================================
 try:
-    print("⏳ Loading Models (Embedder & Reranker)...")
-    embedder = SentenceTransformer('bkai-foundation-models/vietnamese-bi-encoder')
+    print("⏳ Loading Models (Embedder & Reranker) on CPU to save VRAM...")
+    embedder = SentenceTransformer('bkai-foundation-models/vietnamese-bi-encoder', device=device)
     reranker = CrossEncoder('BAAI/bge-reranker-v2-m3', max_length=512, device=device)
-except:
-    print("❌ Lỗi load Embedder/Reranker")
+    print("✅ Embedder & Reranker Ready (CPU Mode)!")
+except Exception as e:
+    print(f"❌ Lỗi load Embedder/Reranker: {e}")
     embedder, reranker = None, None
 
 rag_index = None
@@ -52,29 +60,120 @@ if os.path.exists(RAG_INDEX_PATH):
     except Exception as e:
         print(f"❌ Lỗi BM25: {e}")
 
-print(f"⏳ Loading GenAI Model...")
+# ==============================================================================
+# LOAD QWEN-3B-4BIT
+# ==============================================================================
+print(f"⏳ Loading Qwen-3B-4bit from {MODEL_ID}...")
 try:
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, trust_remote_code=True)
-    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    base_model = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, dtype=torch.float16, device_map=device)
-    model = PeftModel.from_pretrained(base_model, ADAPTER_DIR)
-    print("✅ Model Ready!")
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        device_map="auto",
+        trust_remote_code=True,
+        low_cpu_mem_usage=True
+    )
+    print(f"✅ Model 3B Ready! (VRAM optimized)")
+
+    # Dọn dẹp RAM sau khi load
+    torch.cuda.empty_cache()
+    gc.collect()
+
 except Exception as e:
     print(f"❌ Model Error: {e}")
     model = None
 
 
 # ==============================================================================
-# 3. HÀM PHỤ TRỢ: HYBRID SEARCH
+# 3. HÀM PHỤ TRỢ: TÌM KIẾM WEB & HYBRID
 # ==============================================================================
+# ==============================================================================
+# 3. CHỨC NĂNG THÔNG MINH: SUY LUẬN TỪ KHÓA & TRA WIKI
+# ==============================================================================
+def extract_keywords(user_query):
+    """
+    dùng Python cắt bỏ các từ để hỏi thừa thãi.
+    """
+    print(f"⚡ Đang lọc từ khóa nhanh cho: {user_query}")
+
+    # Danh sách các từ rác thường gặp trong câu hỏi
+    stop_phrases = [
+        "cho tôi hỏi", "cho mình hỏi", "bạn có biết", "hãy cho biết",
+        "là gì", "là ai", "như thế nào", "tại sao", "khi nào", "ở đâu", "bao nhiêu",
+        "ý nghĩa của", "nguyên nhân", "diễn biến", "kết quả", "tóm tắt",
+        "có", "những", "các", "cái", "gì", "?", "!",
+        # THÊM CÁC TỪ NỐI NÀY:
+        "trong", "cuộc", "của", "về", "việc", "đã", "đang", "sẽ", "ở", "tại", "bị", "được"
+    ]
+
+    # 1. Chuyển về chữ thường để xử lý
+    clean_text = user_query.lower()
+
+    # 2. Xóa các từ rác
+    for phrase in stop_phrases:
+        clean_text = clean_text.replace(phrase, "")
+
+    # 3. Chuẩn hóa lại (xóa khoảng trắng thừa)
+    clean_text = " ".join(clean_text.split())
+
+    # 4. Nếu xóa hết trơn (câu hỏi quá ngắn), thì lấy lại câu gốc
+    if len(clean_text) < 2:
+        clean_text = user_query
+
+    print(f"👉 Từ khóa nhanh: '{clean_text}'")
+    return clean_text
+
+
+def search_wikipedia(query):
+    """Tìm Top 1 bài và Đọc 3000 ký tự đầu tiên từ Wikipedia Tiếng Việt."""
+    print(f"🌐 Tra cứu Wiki (Deep Read): {query}")
+    wikipedia.set_lang("vi")
+
+    try:
+        # 1. Tìm tiêu đề bài viết khớp nhất
+        search_results = wikipedia.search(query, results=1)
+
+        if not search_results:
+            print("   --> Wiki không tìm thấy bài nào.")
+            return ""
+
+        title = search_results[0]
+        print(f"   --> Đang đọc bài: {title}")
+
+        # 2. Truy cập vào trang để lấy nội dung đầy đủ
+        page = wikipedia.page(title, auto_suggest=False)
+
+        # 3. Lấy 3000 ký tự đầu tiên (Chứa Intro + Infobox + Chương 1)
+        content = page.content[:3000]
+
+        # Xử lý xuống dòng cho gọn
+        clean_content = content.replace("\n\n", "\n")
+
+        return f"NGUỒN: Wikipedia Tiếng Việt ({title})\nNỘI DUNG TRÍCH DẪN:\n{clean_content}..."
+
+    except wikipedia.DisambiguationError as e:
+        # Nếu từ khóa chung chung, lấy bài đầu tiên trong gợi ý
+        try:
+            first_opt = e.options[0]
+            page = wikipedia.page(first_opt, auto_suggest=False)
+            content = page.content[:2000]
+            return f"NGUỒN: Wikipedia ({first_opt})\nNỘI DUNG:\n{content}..."
+        except:
+            return ""
+
+    except Exception as e:
+        print(f"❌ Lỗi Wiki: {e}")
+        return ""
 def hybrid_search(query, top_k=15):
     vec_candidates = []
     if rag_index and embedder:
         vec = embedder.encode([query])
         D, I = rag_index.search(np.array(vec).astype('float32'), k=top_k)
         for idx in I[0]:
-            if idx != -1: vec_candidates.append(idx)
+            if idx != -1:
+                vec_candidates.append(idx)
 
     bm25_candidates = []
     if bm25:
@@ -95,7 +194,7 @@ def hybrid_search(query, top_k=15):
         if idx < len(rag_metadata):
             item = rag_metadata[idx]
             ans = item.get('answer', '').strip()
-            if ans not in seen_answers and len(ans) > 5:
+            if ans not in seen_answers and len(ans) > 10:
                 seen_answers.add(ans)
                 final_candidates.append([query, ans])
 
@@ -103,7 +202,7 @@ def hybrid_search(query, top_k=15):
 
 
 # ==============================================================================
-# 4. BOT RESPONSE - MODIFIED FOR GRADIO CHATBOT
+# 4. BOT RESPONSE (LOGIC THÔNG MINH)
 # ==============================================================================
 def bot_response(message, history):
     if model is None:
@@ -112,10 +211,15 @@ def bot_response(message, history):
         history.append({"role": "assistant", "content": "❌ Lỗi: Model chưa được load"})
         return history, ""
 
-    rag_context = ""
+    final_context = ""
+    source_label = ""
+
+    # Dọn dẹp VRAM trước khi sinh
+    torch.cuda.empty_cache()
 
     try:
-        candidates = hybrid_search(message, top_k=20)
+        # BƯỚC 1: Tìm trong RAG nội bộ
+        candidates = hybrid_search(message, top_k=15)
 
         if candidates and reranker:
             scores = reranker.predict(candidates)
@@ -125,78 +229,110 @@ def bot_response(message, history):
 
             scored_candidates.sort(key=lambda x: x['score'], reverse=True)
 
-            if scored_candidates:
-                best = scored_candidates[0]
-                if best['score'] > -1.5:
-                    rag_context = best['text']
-                    print(f"✅ CHỐT RAG (Score {best['score']:.2f}): {rag_context[:50]}...")
+            # Lấy Top 5
+            top_candidates = scored_candidates[:RERANK_TOP_K]
+
+            if top_candidates:
+                best = top_candidates[0]
+                # BƯỚC 2: Kiểm tra ngưỡng điểm
+                if best['score'] > RAG_THRESHOLD:
+                    final_context = best['text']
+                    source_label = "📚 Dữ liệu nội bộ"
+                    print(f"✅ CHỐT RAG (Score {best['score']:.2f} > {RAG_THRESHOLD})")
                 else:
-                    print("⚠️ Điểm thấp, không lấy context.")
+                    print(f"⚠️ Điểm RAG thấp ({best['score']:.2f} < {RAG_THRESHOLD}) -> Chuyển sang Web Search...")
+
+
+                    wiki_keyword = extract_keywords(message)
+
+
+                    wiki_content = search_wikipedia(wiki_keyword)
+
+                    if wiki_content:
+                        final_context = wiki_content
+                        source_label = f"🌐 Wikipedia (Từ khóa: {wiki_keyword})"
+                        print("✅ WIKI SUCCESS")
+                    else:
+                        print("❌ Wiki failed.")
     except Exception as e:
-        print(f"Search Error: {e}")
+        print(f"Quy trình Search gặp lỗi: {e}")
 
-    if rag_context:
-        prompt = f"""### CHỈ THỊ:
-1. Bạn là trợ lý AI. Nhiệm vụ là trích xuất thông tin từ "BỐI CẢNH" để trả lời.
-2. TUYỆT ĐỐI KHÔNG sử dụng kiến thức bên ngoài.
-3. Nếu BỐI CẢNH nói là A, hãy trả lời là A.
+    # Tạo Prompt
+    if final_context:
+        prompt = f"""### TÀI LIỆU THAM KHẢO:
+    {final_context}
 
-### BỐI CẢNH:
-"{rag_context}"
+    ### CHỈ THỊ TUYỆT ĐỐI:
+    Bạn là trợ lý lịch sử người Việt. Hãy trả lời câu hỏi theo quy tắc:
+    1. **Nguồn tin:** Ưu tiên dùng [TÀI LIỆU] (Nguồn: {source_label}).
+    2. **Bổ sung:** Nếu tài liệu thiếu, hãy dùng kiến thức của bạn và nói "Theo kiến thức của tôi...".
+    3. **Ngôn ngữ:** CHỈ DÙNG TIẾNG VIỆT. Cấm tuyệt đối tiếng Trung/Anh.
+    4. **Văn phong:** Ngắn gọn, súc tích, đi thẳng vào câu trả lời.
 
-### CÂU HỎI:
-{message}
+    ### CÂU HỎI:
+    {message}
 
-### TRẢ LỜI:"""
+    ### TRẢ LỜI:"""
     else:
-        prompt = message
+        # Fallback (Khi không tìm thấy gì cả)
+        prompt = f"""Bạn là trợ lý lịch sử người Việt.
+    Nhiệm vụ: Trả lời câu hỏi ngắn gọn, chính xác bằng Tiếng Việt.
+    Lưu ý: Nếu không biết, hãy nói "Tôi không biết". KHÔNG ĐƯỢC BỊA ĐẶT hay dùng tiếng nước ngoài.
 
+    Câu hỏi: {message}
+    Trả lời:"""
+
+    # Qwen Chat Template
     messages = [
-        {"role": "system", "content": "Bạn là trợ lý AI trung thực. Chỉ trả lời dựa trên dữ liệu được cung cấp."},
-        {"role": "user", "content": prompt}]
+        {"role": "system", "content": "Bạn là trợ lý AI hữu ích."},
+        {"role": "user", "content": prompt}
+    ]
 
-    input_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(device)
+    input_ids = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        return_tensors="pt"
+    ).to(model.device)
+
     attention_mask = (input_ids != tokenizer.pad_token_id).long()
 
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
     generation_kwargs = dict(
         input_ids=input_ids,
         attention_mask=attention_mask,
         streamer=streamer,
         max_new_tokens=256,
         temperature=0.1,
+        top_p=0.95,
         repetition_penalty=1.1,
-        do_sample=True,
+        do_sample=False,  # Greedy Search để trung thực
         pad_token_id=tokenizer.eos_token_id
     )
 
     thread = Thread(target=model.generate, kwargs=generation_kwargs)
     thread.start()
 
-    # Ensure history is a list
     if history is None:
         history = []
 
-    # Add user message
     history.append({"role": "user", "content": message})
 
-    partial_text = ""
+    partial_text = f"({source_label})\n" if final_context else ""
     for new_text in streamer:
         partial_text += new_text
-        # Create temporary history with assistant response
         temp_history = history[:-1] + [
             {"role": "user", "content": message},
             {"role": "assistant", "content": partial_text}
         ]
         yield temp_history, ""
 
-    # Final update
     history.append({"role": "assistant", "content": partial_text})
     yield history, ""
 
 
 # ==============================================================================
-# 5. CUSTOM CSS
+# 5. CUSTOM CSS (GIỮ NGUYÊN UI CỦA BẠN)
 # ==============================================================================
 custom_css = """
 <style>
@@ -293,7 +429,7 @@ with gr.Blocks() as demo:
     gr.Markdown(
         """
         # 🇻🇳 Sử Việt AI - Trợ Lý Lịch Sử Thông Minh
-        ### Hệ thống Hybrid RAG + DPO Fine-tuned Model
+        ### Hệ thống Hybrid RAG + Qwen 3B (Web Fallback)
         *Tìm kiếm kết hợp Vector Search & BM25 | Reranking với Cross-Encoder*
         """
     )
@@ -321,7 +457,7 @@ with gr.Blocks() as demo:
         """
         <div class='footer'>
         💡 <b>Mẹo sử dụng:</b> Đặt câu hỏi cụ thể về lịch sử Việt Nam để nhận câu trả lời chính xác nhất<br>
-        ⚡ Powered by Qwen 2.5-1.5B + Vietnamese Embedder + Reranker
+        ⚡ Powered by Qwen 2.5-3B + Vietnamese Embedder + Reranker
         </div>
         """
     )
@@ -336,7 +472,7 @@ with gr.Blocks() as demo:
 
 if __name__ == "__main__":
     demo.launch(
-        server_name="127.0.0.1",  # Hoặc dùng "0.0.0.0" nếu muốn truy cập từ máy khác trong mạng LAN
+        server_name="127.0.0.1",
         server_port=7860,
-        share=False  # Đổi thành True nếu muốn link public trên internet
+        share=False
     )
